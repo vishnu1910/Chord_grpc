@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package chord;
 
-option go_package = "chordpb";
+option go_package = "github.com/vishnu1910/Chord_grpc/chordpb";
 
 // ChordService defines all remote methods needed for DHT operations.
 service ChordService {
