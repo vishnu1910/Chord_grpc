@@ -18,10 +18,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	pb "chordpb" // Make sure your generated proto files are in package chordpb
+	pb "github.com/vishnu1910/Chord_grpc/chordpb" // ensure that your generated proto files are in package chordpb
 )
 
-// Global constant m defines the bit-space (m bits -> ring size = 2^m).
+// Global constant: m defines the number of bits in the identifier.
 const m = 7
 
 var ringSize = new(big.Int).Exp(big.NewInt(2), big.NewInt(m), nil)
@@ -44,16 +44,21 @@ type Node struct {
 	predecessor *pb.NodeInfo
 	successor   *pb.NodeInfo
 
+	// Finger table with m entries.
 	fingerTable []FingerEntry
-	dataStore   map[string]string
+	// nextFinger pointer indicates the next entry to fix
+	nextFinger int
+
+	dataStore map[string]string
 }
 
 // NewNode creates and returns a new Node with the given ip and port.
 func NewNode(ip string, port int32) *Node {
 	node := &Node{
-		ip:        ip,
-		port:      port,
-		dataStore: make(map[string]string),
+		ip:         ip,
+		port:       port,
+		dataStore:  make(map[string]string),
+		nextFinger: 1, // start fixing from entry 1 (entry 0 is always the immediate successor)
 	}
 	// Calculate ID from "ip|port"
 	input := fmt.Sprintf("%s|%d", ip, port)
@@ -73,7 +78,7 @@ func NewNode(ip string, port int32) *Node {
 		startBig.Mod(startBig, ringSize)
 		node.fingerTable[i] = FingerEntry{
 			start: uint32(startBig.Uint64()),
-			// initialize all entries with self; will be updated over time.
+			// Initially point to self; will be updated in fixFingers.
 			node: &pb.NodeInfo{Ip: ip, Port: port, Id: node.id},
 		}
 	}
@@ -107,6 +112,56 @@ func dialNode(ip string, port int32) (pb.ChordServiceClient, *grpc.ClientConn, e
 	return client, conn, nil
 }
 
+// closestPrecedingFinger returns the closest finger preceding id.
+func (n *Node) closestPrecedingFinger(id uint32) *pb.NodeInfo {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for i := m - 1; i >= 0; i-- {
+		finger := n.fingerTable[i].node
+		if finger != nil && between(finger.Id, n.id, id) {
+			return finger
+		}
+	}
+	// If none found, return self.
+	return &pb.NodeInfo{Ip: n.ip, Port: n.port, Id: n.id}
+}
+
+// findSuccessorLocal returns the successor of the given id (using recursion via RPC if needed).
+func (n *Node) findSuccessorLocal(id uint32) (*pb.NodeInfo, error) {
+	n.mu.Lock()
+	// If id is between n and its successor, then successor is responsible.
+	if between(id, n.id, n.successor.Id) || n.id == n.successor.Id {
+		succ := n.successor
+		n.mu.Unlock()
+		return succ, nil
+	}
+	n.mu.Unlock()
+
+	// Otherwise, use the closest preceding finger.
+	closest := n.closestPrecedingFinger(id)
+	// If the closest finger is ourselves, we have no better choice.
+	if closest.Id == n.id {
+		n.mu.Lock()
+		succ := n.successor
+		n.mu.Unlock()
+		return succ, nil
+	}
+
+	// Make an RPC call to the closest finger.
+	client, conn, err := dialNode(closest.Ip, closest.Port)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := client.FindSuccessor(ctx, &pb.IDRequest{Id: id})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 // ------------ gRPC Service Methods Implementation ---------------
 
 // GetID returns the node’s own id.
@@ -129,7 +184,7 @@ func (n *Node) GetPredecessor(ctx context.Context, req *pb.Empty) (*pb.NodeInfo,
 }
 
 // Insert places a key-value pair into the appropriate node.
-// Here, for simplicity, we assume that a lookup has been done and this node is responsible.
+// (For simplicity, this example assumes the key belongs to this node.)
 func (n *Node) Insert(ctx context.Context, req *pb.InsertRequest) (*pb.InsertResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -163,27 +218,21 @@ func (n *Node) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse,
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	joiningNode := req.JoiningNode
-	// In a full implementation, this node would help the joining node find its proper successor.
-	// Here we use a simple check: if joiningNode.Id is between self and current successor, then update.
+	// If joiningNode's ID lies between this node and its successor, update successor.
 	if between(joiningNode.Id, n.id, n.successor.Id) || n.id == n.successor.Id {
 		n.successor = joiningNode
-		// Update finger table at index 0.
 		n.fingerTable[0].node = joiningNode
 	}
 	return &pb.JoinResponse{Successor: n.successor}, nil
 }
 
 // FindSuccessor returns the successor for a given id.
-// If the id is between this node and its successor, it returns successor;
-// otherwise, it asks the closest preceding node (simplified here by returning successor).
 func (n *Node) FindSuccessor(ctx context.Context, req *pb.IDRequest) (*pb.NodeInfo, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if between(req.Id, n.id, n.successor.Id) || n.id == n.successor.Id {
-		return n.successor, nil
+	succ, err := n.findSuccessorLocal(req.Id)
+	if err != nil {
+		return nil, err
 	}
-	// In a complete implementation, perform recursive lookup via closestPrecedingNode.
-	return n.successor, nil
+	return succ, nil
 }
 
 // FindPredecessor returns the predecessor for a given id.
@@ -198,14 +247,14 @@ func (n *Node) Notify(ctx context.Context, req *pb.NotifyRequest) (*pb.NotifyRes
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	nt := req.Node
-	// If no predecessor or if nt lies between current predecessor and self, update.
+	// If no predecessor or nt lies between the current predecessor and self, update.
 	if n.predecessor == nil || between(nt.Id, n.predecessor.Id, n.id) {
 		n.predecessor = nt
 	}
 	return &pb.NotifyResponse{Message: "Predecessor updated"}, nil
 }
 
-// SendKeys is called by a joining node to receive keys for which it is now responsible.
+// SendKeys is called by a joining node to transfer keys for which it is now responsible.
 func (n *Node) SendKeys(ctx context.Context, req *pb.SendKeysRequest) (*pb.SendKeysResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -218,7 +267,6 @@ func (n *Node) SendKeys(ctx context.Context, req *pb.SendKeysRequest) (*pb.SendK
 		digest := h.Sum(nil)
 		bigInt := new(big.Int).SetBytes(digest)
 		keyHash := uint32(new(big.Int).Mod(bigInt, ringSize).Uint64())
-		// If the key hash lies between this node and the joining node, transfer it.
 		if between(keyHash, n.id, joiningId) {
 			kvPairs = append(kvPairs, &pb.KeyValuePair{Key: k, Value: v})
 			delete(n.dataStore, k)
@@ -229,14 +277,14 @@ func (n *Node) SendKeys(ctx context.Context, req *pb.SendKeysRequest) (*pb.SendK
 
 // ------------- Background Routines ---------------
 
-// fixFingers periodically updates one entry in the finger table.
+// fixFingers periodically updates a single finger table entry in a round-robin fashion.
 func (n *Node) fixFingers() {
 	for {
 		time.Sleep(10 * time.Second)
+		// Get the finger table entry to update.
 		n.mu.Lock()
-		// Choose a random finger index (except 0, which is the immediate successor).
-		i := rand.Intn(m-1) + 1 // index 1..m-1
-		// Compute (n + 2^i) mod ringSize
+		i := n.nextFinger
+		// Compute start = (n + 2^i) mod (2^m)
 		offset := new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(i)), nil)
 		nBig := big.NewInt(int64(n.id))
 		startBig := new(big.Int).Add(nBig, offset)
@@ -244,16 +292,22 @@ func (n *Node) fixFingers() {
 		target := uint32(startBig.Uint64())
 		n.mu.Unlock()
 
-		// Perform FindSuccessor RPC on self (in a complete system, you’d forward this request).
-		connInfo := &pb.IDRequest{Id: target}
-		resp, err := n.FindSuccessor(context.Background(), connInfo)
+		// Find the successor for the target value.
+		succ, err := n.findSuccessorLocal(target)
 		if err != nil {
-			log.Printf("fixFingers RPC error: %v", err)
-			continue
+			log.Printf("fixFingers RPC error for entry %d: %v", i, err)
+		} else {
+			n.mu.Lock()
+			n.fingerTable[i].node = succ
+			n.mu.Unlock()
 		}
 
+		// Move to the next finger entry.
 		n.mu.Lock()
-		n.fingerTable[i].node = resp
+		n.nextFinger = (n.nextFinger + 1) % m
+		if n.nextFinger == 0 {
+			n.nextFinger = 1 // always leave index 0 unchanged (immediate successor)
+		}
 		n.mu.Unlock()
 	}
 }
@@ -262,26 +316,27 @@ func (n *Node) fixFingers() {
 func (n *Node) stabilize() {
 	for {
 		time.Sleep(10 * time.Second)
-		var successorPred *pb.NodeInfo
 
-		// Get the predecessor of our successor.
+		// Query the current successor for its predecessor.
 		client, conn, err := dialNode(n.successor.Ip, n.successor.Port)
 		if err != nil {
 			log.Printf("stabilize: error dialing successor: %v", err)
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		successorPred, err = client.GetPredecessor(ctx, &pb.Empty{})
+		successorPred, err := client.GetPredecessor(ctx, &pb.Empty{})
 		cancel()
 		conn.Close()
 
 		n.mu.Lock()
-		// If successor's predecessor exists and lies between this node and successor, update.
+		// If successor's predecessor exists and is in-between, update successor.
 		if successorPred != nil && between(successorPred.Id, n.id, n.successor.Id) {
 			n.successor = successorPred
 			n.fingerTable[0].node = successorPred
 		}
-		// Notify the (new) successor.
+		n.mu.Unlock()
+
+		// Notify the (possibly updated) successor.
 		client2, conn2, err := dialNode(n.successor.Ip, n.successor.Port)
 		if err == nil {
 			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
@@ -291,7 +346,6 @@ func (n *Node) stabilize() {
 			cancel2()
 			conn2.Close()
 		}
-		n.mu.Unlock()
 	}
 }
 
@@ -318,7 +372,7 @@ func main() {
 	node := NewNode(ip, port)
 	log.Printf("Node starting with id %d on %s:%d", node.id, ip, port)
 
-	// If a join address is provided, attempt to join the existing chord ring.
+	// If a join address is provided, join an existing chord ring.
 	if *joinFlag != "" {
 		parts := strings.Split(*joinFlag, ":")
 		if len(parts) != 2 {
@@ -334,7 +388,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error joining ring: %v", err)
 		}
-		// Send a Join RPC to the known node.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		joinResp, err := client.Join(ctx, &pb.JoinRequest{
 			JoiningNode: &pb.NodeInfo{Ip: ip, Port: port, Id: node.id},
@@ -350,7 +403,6 @@ func main() {
 		node.mu.Unlock()
 		log.Printf("Joined ring; successor is node %d", joinResp.Successor.Id)
 	} else {
-		// Creating a new ring: predecessor and successor remain self.
 		log.Println("Creating new ring.")
 	}
 
@@ -361,7 +413,7 @@ func main() {
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterChordServiceServer(grpcServer, node)
-	// Enable reflection to simplify debugging with tools like grpcurl.
+	// Enable reflection for debugging.
 	reflection.Register(grpcServer)
 
 	// Run background routines.
