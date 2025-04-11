@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package chord;
+
+option go_package = "chordpb";
+
+// ChordService defines all remote methods needed for DHT operations.
+service ChordService {
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc FindSuccessor(IDRequest) returns (NodeInfo);
+  rpc FindPredecessor(IDRequest) returns (NodeInfo);
+  rpc GetSuccessor(Empty) returns (NodeInfo);
+  rpc GetPredecessor(Empty) returns (NodeInfo);
+  rpc GetID(Empty) returns (IDResponse);
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+  rpc SendKeys(SendKeysRequest) returns (SendKeysResponse);
+}
+
+message Empty {}
+
+message IDRequest {
+  uint32 id = 1;
+}
+
+message IDResponse {
+  uint32 id = 1;
+}
+
+message NodeInfo {
+  string ip = 1;
+  int32 port = 2;
+  uint32 id = 3;
+}
+
+message InsertRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message InsertResponse {
+  string message = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  string message = 1;
+}
+
+message SearchRequest {
+  string key = 1;
+}
+
+message SearchResponse {
+  string value = 1;
+}
+
+message JoinRequest {
+  NodeInfo joining_node = 1;
+}
+
+message JoinResponse {
+  NodeInfo successor = 1;
+}
+
+message NotifyRequest {
+  NodeInfo node = 1;
+}
+
+message NotifyResponse {
+  string message = 1;
+}
+
+message SendKeysRequest {
+  uint32 joiningNodeId = 1;
+}
+
+message KeyValuePair {
+  string key = 1;
+  string value = 2;
+}
+
+message SendKeysResponse {
+  repeated KeyValuePair keyValues = 1;
+}
